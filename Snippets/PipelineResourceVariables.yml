@@ -1,0 +1,24 @@
+# https://docs.microsoft.com/en-us/azure/devops/pipelines/process/resources?view=azure-devops&tabs=schema#resources-pipelines
+
+# Script that displays all the metadata about a pipeline resource that is available at runtime.
+
+resources:
+  pipelines:
+  # deployment job will by default download the artifacts produced by the pipeline hereunder into $(Pipeline.Workspace)\pipelineAlias
+  - pipeline: pipelineAlias
+    source: 'name of the actual pipeline used as resource'    # Name of the CI (build) pipeline
+
+
+steps:
+- script: |
+	echo 'projectID $(resources.pipeline.pipelineAlias.projectID)'
+	echo 'pipelineName $(resources.pipeline.pipelineAlias.pipelineName)'
+	echo 'pipelineID $(resources.pipeline.pipelineAlias.pipelineID)'
+	echo 'runName $(resources.pipeline.pipelineAlias.runName)' # This contains the value of the Build.BuildNumber we set in the build pipeline
+	echo 'runID $(resources.pipeline.pipelineAlias.runID)'
+	echo 'runURI $(resources.pipeline.pipelineAlias.runURI)'
+	echo 'sourceBranch $(resources.pipeline.pipelineAlias.sourceBranch)'
+	echo 'sourceCommit $(resources.pipeline.pipelineAlias.sourceCommit)'
+	echo 'sourceProvider $(resources.pipeline.pipelineAlias.sourceProvider)'
+	echo 'requestedFor $(resources.pipeline.pipelineAlias.requestedFor)'
+	echo 'requestedForID $(resources.pipeline.pipelineAlias.requestedForID)'
