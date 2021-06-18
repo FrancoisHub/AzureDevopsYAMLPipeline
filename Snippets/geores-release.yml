@@ -1,0 +1,318 @@
+trigger:
+- none
+
+variables:
+  - group: BizTalk2020_ACC
+  - name: ApplicationName
+    value: 'Geores'
+  - name: InstallationFolder
+    value: 'C:\Program Files (x86)\Ores\Geores'
+
+resources:
+  pipelines:
+  # download the artifacts into $(Pipeline.Workspace)\Geores2020
+  - pipeline: Geores2020
+    source: 'Geores 2020 Release Build'    # Name of the CI (build) pipeline
+    
+stages:
+  - stage: ACC_Deploy
+    displayName: 'ACC Deploy'
+    variables:
+      - name: TargetEnvironment
+        value: ACC
+    jobs:
+      - deployment: StopApplication
+        displayName: Stop Application
+        workspace:
+          clean: all
+        environment:
+          name: 'bts-2020-acc.XS0610610'
+          resourceType: VirtualMachine
+          #tags: bts-2020-acc-mgmt
+        strategy:
+          # alternative approach: try with predeploy task to stop application (predeploy step does not download artifacts)
+          # rolling deployment  waits for deployments on each set of virtual machines to complete before proceeding to the next set of deployments
+          # rolling:
+          #   maxParallel: 1
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - powershell: |
+                    echo "Build number $(Build.BuildNumber)"
+                    echo "runName (where version number is stored) $(resources.pipeline.Geores2020.runName)"
+                    $ApplicationExist = Test-BizTalkApplication -Name ${{variables.ApplicationName}}
+                    if($ApplicationExist)
+                    {
+                      echo "##vso[task.setvariable variable=BtsAppExist;isOutput=true]true"
+                      Write-Host "Application ${{variables.ApplicationName}} exists"
+                      Stop-BizTalkApplication -Name ${{variables.ApplicationName}} -StopOptions StopAll -TerminateServiceInstances
+                    }
+                    else
+                    {
+                      echo "##vso[task.setvariable variable=BtsAppExist;isOutput=true]false"
+                      Write-Host "Application ${{variables.ApplicationName}} does not exist"
+                    }
+                  name: StopBizTalkApplication
+                  displayName: Stop BizTalk Application
+                  failOnStderr: true
+                # - powershell: |
+                #     Write-Host "Is the Application ${{variables.ApplicationName}} installed in BizTalk? $(StopBizTalkApplication.BtsAppExist)"
+      - deployment: UninstallAppMgmgDB
+        displayName: Uninstall Application on Management Server
+        dependsOn: StopApplication
+        # For simplification reason, always run this deployment if StopApplication succeeds
+        #condition: and(succeeded('StopApplication'), eq(dependencies.StopApplication.outputs['Deploy_XS0610610.StopBizTalkApplication.BtsAppExist'], 'true'))
+        environment:
+          name: 'bts-2020-acc.XS0610610'
+          resourceType: VirtualMachine
+        strategy:
+         runOnce:
+           deploy:
+             steps:
+               - download: none
+               - task: PowerShell@2
+                 name: UninstallBizTalkApp
+                 displayName: Uninstall BizTalk Application
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Uninstall BizTalk Application on Management Server"
+                      # 2 ways to simulate Failure:
+                      # exit 1
+                      # Write-Host "##vso[task.complete result=Failed;]DONE"
+                      if (Test-Path -Path "${{variables.InstallationFolder}}")
+                      {
+                        $numberOfPreviousInstall = (Get-ChildItem -Path "${{variables.InstallationFolder}}" -Directory | Measure-Object).Count
+                        if ($numberOfPreviousInstall -gt 1)
+                        {
+                          Write-Host  "##vso[task.LogIssue type=error;]$numberOfPreviousInstall previous installations exist in ${{variables.InstallationFolder}} - Cannot decide which one to uninstall."
+                          exit 1
+                        }
+                        if ($numberOfPreviousInstall -eq 1)
+                        {
+                          Push-Location -Path "${{variables.InstallationFolder}}\*" -PassThru
+                          $m = .\Manifest.ps1 -ManagementServer $(ManagementDBSQLInstance) -BizTalkAdministratorGroup $(BizTalkAdministratorGroup) -BizTalkApplicationUserGroup $(BizTalkApplicationUserGroup) -BizTalkIsolatedHostUserGroup $(BizTalkIsolatedHostUserGroup) -Verbose
+                          Uninstall-BizTalkPackage -Manifest $m -TargetEnvironment $(TargetEnvironment) -Verbose
+                          echo "##vso[task.setvariable variable=ShouldDeleteFolder]true"
+                        }
+                      }
+                    failOnStderr: true
+               - task: PowerShell@2
+                 name: DeleteInstallFolder
+                 displayName: Delete the folder containing the existing installation
+                 condition: eq(variables['ShouldDeleteFolder'], 'true')
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Delete Binaries on installation folder"
+                      Get-ChildItem -Path "${{variables.InstallationFolder}}" -Recurse | Remove-Item -force -recurse
+                    failOnStderr: true
+      - deployment: UninstallAppBackend
+        displayName: Uninstall Application on Backend Server
+        dependsOn: UninstallAppMgmgDB
+        # This condition is necessary to force this job to run in case the job InstallAppMgmgtDB is skipped or (as succeeded() returns false in that case).
+        #condition: in(dependencies.InstallAppMgmgtDB.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+        environment:
+          name: 'bts-2020-acc.XS0610611'
+          resourceType: VirtualMachine
+          #tags: bts-2020-acc-mgmt
+        strategy:
+         runOnce:
+           deploy:
+             steps:
+               - download: none
+               - task: PowerShell@2
+                 name: UninstallBizTalkApp
+                 displayName: Uninstall BizTalk Application
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Uninstall Application on Backend Server"
+                      if (Test-Path -Path "${{variables.InstallationFolder}}")
+                      {
+                        $numberOfPreviousInstall = (Get-ChildItem -Path "${{variables.InstallationFolder}}" -Directory | Measure-Object).Count
+                        if ($numberOfPreviousInstall -gt 1)
+                        {
+                          Write-Host  "##vso[task.LogIssue type=error;]$numberOfPreviousInstall previous installations exist in ${{variables.InstallationFolder}} - Cannot decide which one to uninstall."
+                          exit 1
+                        }
+                        if ($numberOfPreviousInstall -eq 1)
+                        {
+                          Push-Location -Path "${{variables.InstallationFolder}}\*" -PassThru
+                          $m = .\Manifest.ps1 -ManagementServer $(ManagementDBSQLInstance) -BizTalkAdministratorGroup $(BizTalkAdministratorGroup) -BizTalkApplicationUserGroup $(BizTalkApplicationUserGroup) -BizTalkIsolatedHostUserGroup $(BizTalkIsolatedHostUserGroup) -Verbose
+                          Uninstall-BizTalkPackage -Manifest $m -TargetEnvironment $(TargetEnvironment) -SkipMgmtDbDeployment -Verbose
+                          echo "##vso[task.setvariable variable=ShouldDeleteFolder]true"
+                        }
+                      }
+                    failOnStderr: true
+               - task: PowerShell@2
+                 name: DeleteInstallFolder
+                 displayName: Delete the folder containing the existing installation
+                 condition: eq(variables['ShouldDeleteFolder'], 'true')
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Delete Binaries on installation folder"
+                      Get-ChildItem -Path "${{variables.InstallationFolder}}" -Recurse | Remove-Item -force -recurse
+                    failOnStderr: true
+      - deployment: InstallAppB2B
+        displayName: Install Application on B2B Servers
+        dependsOn: UninstallAppBackend
+        # This condition is necessary to force this job to run in case the job InstallAppBackend is skipped or (as succeeded() returns false in that case).
+        #condition: in(dependencies.InstallAppBackend.result, 'Succeeded', 'SucceededWithIssues', 'Skipped')
+        environment:
+          #name: 'bts-2020-acc.XS0610608'
+          name: 'bts-2020-acc'
+          resourceType: VirtualMachine
+          tags: b2b
+        strategy:
+         rolling:
+           preDeploy:
+             steps:
+               - task: PowerShell@2
+                 name: UninstallBizTalkApp
+                 displayName: Uninstall BizTalk Application
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Uninstall Application on Backend Server"
+                      if (Test-Path -Path "${{variables.InstallationFolder}}")
+                      {
+                        $numberOfPreviousInstall = (Get-ChildItem -Path "${{variables.InstallationFolder}}" -Directory | Measure-Object).Count
+                        if ($numberOfPreviousInstall -gt 1)
+                        {
+                          Write-Host  "##vso[task.LogIssue type=error;]$numberOfPreviousInstall previous installations exist in ${{variables.InstallationFolder}} - Cannot decide which one to uninstall."
+                          exit 1
+                        }
+                        if ($numberOfPreviousInstall -eq 1)
+                        {
+                          Push-Location -Path "${{variables.InstallationFolder}}\*" -PassThru
+                          $m = .\Manifest.ps1 -ManagementServer $(ManagementDBSQLInstance) -BizTalkAdministratorGroup $(BizTalkAdministratorGroup) -BizTalkApplicationUserGroup $(BizTalkApplicationUserGroup) -BizTalkIsolatedHostUserGroup $(BizTalkIsolatedHostUserGroup) -Verbose
+                          Uninstall-BizTalkPackage -Manifest $m -TargetEnvironment $(TargetEnvironment) -SkipMgmtDbDeployment -Verbose
+                          echo "##vso[task.setvariable variable=ShouldDeleteFolder]true"
+                        }
+                      }
+                    failOnStderr: true
+               - task: PowerShell@2
+                 name: DeleteInstallFolder
+                 displayName: Delete the folder containing the existing installation
+                 condition: eq(variables['ShouldDeleteFolder'], 'true')
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Delete Binaries on installation folder"
+                      Get-ChildItem -Path "${{variables.InstallationFolder}}" -Recurse | Remove-Item -force -recurse
+                    failOnStderr: true
+           deploy:
+             steps:
+               - download: none
+               - task: PowerShell@2
+                 name: DownloadArtifact
+                 displayName: 'Download Artifact'
+                 condition: eq(variables['UninstallOnly'], 'false')
+                 inputs:
+                  targetType: 'inline'
+                  script: |
+                    # $headers = @{Authorization = 'Bearer ' + $env:SYSTEM_ACCESSTOKEN }
+                    $headers = @{Authorization = 'Bearer $(System.AccessToken)' }
+                    $url = 'https://dev.azure.com/ores/EAI/_apis/build/builds/'+ $(resources.pipeline.Geores2020.runID) +'/artifacts?artifactName=BizTalkPackages'
+                    Write-Host 'Url ' $url
+                    
+                    $build = Invoke-RestMethod -Method Get -Uri $url -UseBasicParsing -Headers $headers -Verbose
+                    Write-Host 'DownloadUrl: ' + $build.resource.downloadUrl
+                    
+                    $zipFilename = 'BizTalkPackages.zip'
+                    Invoke-RestMethod -Method Get -Uri $build.resource.downloadUrl -UseBasicParsing -Headers $headers -ContentType application/zip -Outfile $zipFilename -Verbose
+                    
+                    Microsoft.PowerShell.Archive\Expand-Archive -Path $zipFilename -DestinationPath $(Pipeline.Workspace) -Force
+                    echo "##vso[task.setvariable variable=DownloadArtifactSuccess]true"
+                    ls
+                  failOnStderr: true
+               - task: ExtractFiles@1
+                 name: ExtractFiles
+                 displayName: Extract artifacts into installation folder
+                 condition: eq(variables['UninstallOnly'], 'false')
+                 inputs:
+                   archiveFilePatterns: '$(Pipeline.Workspace)/BizTalkPackages/Geores-$(resources.pipeline.Geores2020.runName).zip'
+                   destinationFolder: '${{variables.InstallationFolder}}\$(resources.pipeline.Geores2020.runName)'
+                   cleanDestinationFolder: true
+                   overwriteExistingFiles: true
+               - task: PowerShell@2
+                 name: InstallBizTalkPackage
+                 displayName: Install BizTalk Package
+                 condition: eq(variables['UninstallOnly'], 'false')
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Install Application on Server"
+                      Push-Location -Path "${{variables.InstallationFolder}}\$(resources.pipeline.Geores2020.runName)" -PassThru
+                      $m = .\Manifest.ps1 -ManagementServer $(ManagementDBSQLInstance) -BizTalkAdministratorGroup $(BizTalkAdministratorGroup) -BizTalkApplicationUserGroup $(BizTalkApplicationUserGroup) -BizTalkIsolatedHostUserGroup $(BizTalkIsolatedHostUserGroup) -Verbose
+                      Install-BizTalkPackage -Manifest $m -TargetEnvironment $(TargetEnvironment) -SkipMgmtDbDeployment -SkipUndeploy -Verbose
+                    failOnStderr: true
+      - deployment: InstallAppBackend
+        displayName: Install Application on Backend Server
+        dependsOn:
+         - UninstallAppBackend
+         - InstallAppB2B
+        condition: and(succeeded('UninstallAppBackend'), eq(variables['UninstallOnly'], 'false'))
+        environment:
+          name: 'bts-2020-acc.XS0610611'
+          resourceType: VirtualMachine
+        strategy:
+         runOnce:
+           deploy:
+             steps:
+               - task: ExtractFiles@1
+                 inputs:
+                   archiveFilePatterns: '$(Pipeline.Workspace)/Geores2020/BizTalkPackages/Geores-$(resources.pipeline.Geores2020.runName).zip'
+                   destinationFolder: '${{variables.InstallationFolder}}\$(resources.pipeline.Geores2020.runName)'
+                   cleanDestinationFolder: false
+                   overwriteExistingFiles: true
+               - task: PowerShell@2
+                 name: InstallBizTalkPackage
+                 displayName: Install BizTalk Package
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Install Application on Management Server"
+                      Push-Location -Path "${{variables.InstallationFolder}}\$(resources.pipeline.Geores2020.runName)" -PassThru
+                      $m = .\Manifest.ps1 -ManagementServer $(ManagementDBSQLInstance) -BizTalkAdministratorGroup $(BizTalkAdministratorGroup) -BizTalkApplicationUserGroup $(BizTalkApplicationUserGroup) -BizTalkIsolatedHostUserGroup $(BizTalkIsolatedHostUserGroup) -Verbose
+                      Install-BizTalkPackage -Manifest $m -TargetEnvironment $(TargetEnvironment) -SkipMgmtDbDeployment -SkipUndeploy -Verbose
+                    failOnStderr: true
+      - deployment: InstallAppMgmgtDB
+        displayName: Install Application on Management Server
+        # dependsOn:
+        # - StopApplication
+        # - UninstallAppMgmgDB
+        dependsOn:
+         - UninstallAppMgmgDB
+         - InstallAppBackend
+        # This condition is necessary to force this job to run in case the job UninstallAppMgmgDB is skipped (as succeeded() returns false in that case).
+        #condition: and(succeeded('StopApplication'), in(dependencies.UninstallAppMgmgDB.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'), eq(variables['UninstallOnly'], 'false'))
+        # For simplification we always run the uninstall deployments
+        condition: and(succeeded('UninstallAppMgmgDB'), eq(variables['UninstallOnly'], 'false'))
+        environment:
+          name: 'bts-2020-acc.XS0610610'
+          resourceType: VirtualMachine
+        strategy:
+         runOnce:
+           deploy:
+             steps:
+               - task: ExtractFiles@1
+                 inputs:
+                   archiveFilePatterns: '$(Pipeline.Workspace)/Geores2020/BizTalkPackages/Geores-$(resources.pipeline.Geores2020.runName).zip'
+                   destinationFolder: '${{variables.InstallationFolder}}\$(resources.pipeline.Geores2020.runName)'
+                   cleanDestinationFolder: false
+                   overwriteExistingFiles: true
+               - task: PowerShell@2
+                 name: InstallBizTalkPackage
+                 displayName: Install BizTalk Package
+                 inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "Install Application on Management Server"
+                      Push-Location -Path "${{variables.InstallationFolder}}\$(resources.pipeline.Geores2020.runName)" -PassThru
+                      $m = .\Manifest.ps1 -ManagementServer $(ManagementDBSQLInstance) -BizTalkAdministratorGroup $(BizTalkAdministratorGroup) -BizTalkApplicationUserGroup $(BizTalkApplicationUserGroup) -BizTalkIsolatedHostUserGroup $(BizTalkIsolatedHostUserGroup) -Verbose
+                      Install-BizTalkPackage -Manifest $m -TargetEnvironment $(TargetEnvironment) -SkipUndeploy -Verbose
+                    failOnStderr: true
